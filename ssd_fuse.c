@@ -18,17 +18,23 @@
 
 #define SSD_NAME "ssd_file"
 
+#define ROUND_UP(n,d) (((n) + (d-1)) & (-d))
+#define MIN(a,b)      ((a) > (b) ? (b) : (a))
+
 enum {
     SSD_NONE,
     SSD_ROOT,
     SSD_FILE,
 };
 
-static size_t physic_size;
+static size_t physic_size; // pages number
 static size_t logic_size;
 static size_t host_write_size;
 static size_t nand_write_size;
 
+/*
+    pca = nand:lba
+*/
 typedef union pca_rule PCA_RULE;
 union pca_rule {
     unsigned int pca;
@@ -42,7 +48,10 @@ PCA_RULE curr_pca;
 
 static unsigned int get_next_pca();
 
-unsigned int* L2P,* P2L,* valid_count, free_block_number;
+unsigned int *L2P;
+unsigned int *P2L;
+unsigned int *valid_count;
+unsigned int free_block_number;
 
 static int ssd_resize(size_t new_size) {
     // set logic size to new_size
@@ -143,8 +152,8 @@ static unsigned int get_next_pca() {
         free_block_number--;
         return curr_pca.pca;
     }
-
-    if(curr_pca.fields.lba == 9) {
+     
+    if(curr_pca.fields.lba == (PAGE_PER_BLOCK - 1)) {
         int temp = get_next_block();
         if (temp == OUT_OF_BLOCK) {
             return OUT_OF_BLOCK;
@@ -157,6 +166,7 @@ static unsigned int get_next_pca() {
         }
     }
     else {
+        // get the next page
         curr_pca.fields.lba += 1;
     }
     return curr_pca.pca;
@@ -165,10 +175,39 @@ static unsigned int get_next_pca() {
 
 static int ftl_read(char* buf, size_t lba) {
     // TODO
+    // 1. Check L2P to get PCA
+    // 2. Send read data into buf
+    int pca = L2P[lba];
+    if (pca == INVALID_PCA) {
+        printf("################ ftl_read: Try to read an invalid LBA = %ld\n", lba);
+        return -EINVAL;
+    }
+    return nand_read(buf, pca);
 }
 
-static int ftl_write(const char* buf, size_t lba_rnage, size_t lba) {
+static int ftl_write(const char* buf, size_t lba, size_t size, off_t offset) {
     // TODO
+    // 1. read old page 
+    // 2. updated
+    // 3. allocate a new PCA address
+    // 4. send write cmd
+    // 5. update L2P
+    int ret;
+    int pca = L2P[lba];
+    char *tmp_buf = calloc(PAGE_SIZE, sizeof(char));
+
+    if (pca != INVALID_PCA) {
+        nand_read(tmp_buf, pca);
+    }
+    memcpy(tmp_buf + offset, buf, size);
+
+    pca = get_next_pca();
+    if (pca == OUT_OF_BLOCK) {
+        return OUT_OF_BLOCK;
+    }
+    ret = nand_write(tmp_buf, pca);
+    L2P[lba] = pca;
+    return ret;
 }
 
 
@@ -182,6 +221,10 @@ static int ssd_file_type(const char* path) {
     return SSD_NONE;
 }
 
+/* 
+    hard-coded
+    size of ssd_file = logic_size
+*/
 static int ssd_getattr(const char* path, struct stat* stbuf,
                        struct fuse_file_info* fi) {
     (void) fi;
@@ -204,6 +247,9 @@ static int ssd_getattr(const char* path, struct stat* stbuf,
     return 0;
 }
 
+/* 
+    Just return success
+*/
 static int ssd_open(const char* path, struct fuse_file_info* fi) {
     (void) fi;
     if (ssd_file_type(path) != SSD_NONE) {
@@ -213,7 +259,8 @@ static int ssd_open(const char* path, struct fuse_file_info* fi) {
 }
 
 static int ssd_do_read(char* buf, size_t size, off_t offset) {
-    int tmp_lba, tmp_lba_range, rst;
+    int i;
+    int tmp_lba, tmp_lba_range;
     char *tmp_buf;
 
     // off limit
@@ -230,9 +277,10 @@ static int ssd_do_read(char* buf, size_t size, off_t offset) {
     tmp_lba_range = (offset + size - 1) / PAGE_SIZE - (tmp_lba) + 1;
     tmp_buf       = calloc(tmp_lba_range * PAGE_SIZE, sizeof(char));
 
-    for (int i = 0; i < tmp_lba_range; i++) {
+    for (i = 0; i < tmp_lba_range; i++) {
         // TODO
-        // call ftl_read
+        if (ftl_read(tmp_buf + i * PAGE_SIZE, tmp_lba + i) != PAGE_SIZE)
+            return 0;
     }
 
     memcpy(buf, tmp_buf + offset % PAGE_SIZE, size);
@@ -250,30 +298,42 @@ static int ssd_read(const char* path, char* buf, size_t size,
 }
 
 static int ssd_do_write(const char* buf, size_t size, off_t offset) {
-    int tmp_lba, tmp_lba_range, process_size;
-    int idx, curr_size, remain_size, rst;
-    char* tmp_buf;
+    int i;
+    int tmp_lba, tmp_lba_range;
+    int process_size;
+    int remain_size;
+    int curr_size;
 
     host_write_size += size;
     if (ssd_expand(offset + size) != 0) {
         return -ENOMEM;
     }
 
-    tmp_lba = offset / PAGE_SIZE;
+    tmp_lba       = offset / PAGE_SIZE;
     tmp_lba_range = (offset + size - 1) / PAGE_SIZE - (tmp_lba) + 1;
 
     process_size = 0;
     remain_size = size;
-    curr_size = 0;
-    for (idx = 0; idx < tmp_lba_range; idx++) {
+    for (i = 0; i < tmp_lba_range; i++) {
         // TODO
-        // call ftl_write
+        printf("################## remain %d -> %d ####################\n", remain_size, tmp_lba + i);
+        curr_size = PAGE_SIZE - offset % PAGE_SIZE;
+        curr_size = MIN(remain_size, curr_size);
+        
+        if (ftl_write(buf + process_size, tmp_lba + i, curr_size, offset % PAGE_SIZE) != PAGE_SIZE) {
+            printf("############## ssd_do_write: failed\n");
+            break;
+        }
+        
+        offset = ROUND_UP(offset, PAGE_SIZE);
+        remain_size -= curr_size;
+        process_size += curr_size;
     }
-    return size;
+    return process_size;
 }
 
 static int ssd_write(const char* path, const char* buf, size_t size,
-                     off_t offset, struct fuse_file_info* fi) {
+                     off_t  offset, struct fuse_file_info* fi) {
 
     (void) fi;
     if (ssd_file_type(path) != SSD_FILE) {
@@ -296,6 +356,9 @@ static int ssd_truncate(const char* path, off_t size,
     return ssd_resize(size);
 }
 
+/* 
+    hard-coded
+*/
 static int ssd_readdir(const char* path, void* buf, fuse_fill_dir_t filler,
                        off_t offset, struct fuse_file_info* fi,
                        enum fuse_readdir_flags flags) {
@@ -311,6 +374,11 @@ static int ssd_readdir(const char* path, void* buf, fuse_fill_dir_t filler,
     return 0;
 }
 
+/* 
+    SSD_GET_LOGIC_SIZE:  logic_size
+    SSD_GET_PHYSIC_SIZE: physic_size
+    SSD_GET_WA:          nand_write_size / host_write_size
+*/
 static int ssd_ioctl(const char* path, unsigned int cmd, void* arg,
                      struct fuse_file_info* fi, unsigned int flags, void* data) {
 
@@ -366,8 +434,7 @@ int main(int argc, char* argv[]) {
         FILE* fptr;
         snprintf(nand_name, 100, "%s/nand_%d", NAND_LOCATION, idx);
         fptr = fopen(nand_name, "w");
-        if (fptr == NULL)
-        {
+        if (fptr == NULL) {
             printf("open fail");
         }
         fclose(fptr);
