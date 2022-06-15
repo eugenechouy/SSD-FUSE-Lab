@@ -7,5 +7,8 @@ $(TARGET): ssd_fuse.c $(TEST)
 $(TEST): ssd_fuse_dut.c
 	gcc -Wall ssd_fuse_dut.c -o ssd_fuse_dut
 
+run:
+	./ssd_fuse -d /tmp/ssd
+
 clean:
 	rm $(TARGET) $(TEST)

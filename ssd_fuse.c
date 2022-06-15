@@ -135,6 +135,8 @@ static int nand_erase(int block_index) {
         return 0;
     }
     fclose(fptr);
+    physic_size -= PAGE_PER_BLOCK;
+    free_block_number++;
     valid_count[block_index] = FREE_BLOCK;
     return 1;
 }
@@ -216,12 +218,15 @@ static int ftl_write(const char* buf, size_t lba, size_t size, off_t offset) {
         hot_pca.pca = pca;
         valid_count[my_pca.fields.nand]--;
         P2L_set(pca, INVALID_LBA);
-    } 
+    } else {
+        hot_pca.pca = INVALID_PCA;
+    }
 
     // if write size not align to PAGE_SIZE, do read_modify_write
     if (size != PAGE_SIZE) {
         tmp_buf = calloc(PAGE_SIZE, sizeof(char));
-        nand_read(tmp_buf, pca);
+        if (pca != INVALID_PCA)
+            nand_read(tmp_buf, pca);
         memcpy(tmp_buf + offset, buf, size);
         ret = nand_write(tmp_buf, new_pca);
     } else {
@@ -230,8 +235,9 @@ static int ftl_write(const char* buf, size_t lba, size_t size, off_t offset) {
     L2P[lba] = new_pca;
     P2L_set(new_pca, lba);
 
-    if (physic_size >= 80) 
+    if (free_block_number <= GC_THRESHOLD) {
         ftl_gc();
+    }
 
     return ret;
 }
@@ -250,7 +256,6 @@ static int ftl_gc_move(int block_index) {
         lba = P2L[(my_pca.fields.nand * PAGE_PER_BLOCK + my_pca.fields.lba)];
         if (lba != INVALID_LBA) {
             nand_read(tmp_buf, my_pca.pca);
-            printf("########### gc move %d %d\n", i, lba);
             new_pca = get_next_pca();
             if (new_pca == OUT_OF_BLOCK) {
                 printf("ftl_gc: OUT_OF_BLOCK\n");
@@ -279,7 +284,7 @@ static void ftl_gc() {
             target_block = i;
         }
     }
-    printf("############## gc %d: %d valid page\n", target_block, min_valid_count);
+    printf("################## gc %d: %d valid page ##################\n", target_block, min_valid_count);
 
     if (target_block != -1) {
         ftl_gc_move(target_block);
@@ -391,7 +396,7 @@ static int ssd_do_write(const char* buf, size_t size, off_t offset) {
     remain_size = size;
     for (i = 0; i < tmp_lba_range; i++) {
         // TODO
-        printf("################## remain %d -> %d ####################\n", remain_size, tmp_lba + i);
+        printf("################## ssd_do_write %d -> %d (%ld) ####################\n", remain_size, tmp_lba + i, physic_size);
         curr_size = PAGE_SIZE - offset % PAGE_SIZE;
         curr_size = MIN(remain_size, curr_size);
         
@@ -425,6 +430,7 @@ static int ssd_truncate(const char* path, off_t size,
     memset(valid_count, FREE_BLOCK, sizeof(int) * PHYSICAL_NAND_NUM);
     curr_pca.pca = INVALID_PCA;
     free_block_number = PHYSICAL_NAND_NUM;
+    physic_size       = 0;
     if (ssd_file_type(path) != SSD_FILE) {
         return -EINVAL;
     }

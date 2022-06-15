@@ -20,6 +20,8 @@
 #define PAGE_PER_BLOCK     (10)
 #define PAGE_SIZE          (512)
 
+#define GC_THRESHOLD       (0)
+
 #define NAND_LOCATION      "/home/eugenechouy/Documents/osdi/final"
 
 enum {
