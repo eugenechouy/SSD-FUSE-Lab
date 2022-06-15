@@ -45,13 +45,21 @@ union pca_rule {
 };
 
 PCA_RULE curr_pca;
+PCA_RULE hot_pca;
 
 static unsigned int get_next_pca();
+static void ftl_gc();
 
 unsigned int *L2P;
 unsigned int *P2L;
 unsigned int *valid_count;
 unsigned int free_block_number;
+
+void P2L_set(unsigned int pca, unsigned int lba) {
+    PCA_RULE my_pca;
+    my_pca.pca = pca;
+    P2L[(my_pca.fields.nand * PAGE_PER_BLOCK + my_pca.fields.lba)] = lba;
+}
 
 static int ssd_resize(size_t new_size) {
     // set logic size to new_size
@@ -187,29 +195,96 @@ static int ftl_read(char* buf, size_t lba) {
 
 static int ftl_write(const char* buf, size_t lba, size_t size, off_t offset) {
     // TODO
-    // 1. read old page 
-    // 2. updated
-    // 3. allocate a new PCA address
-    // 4. send write cmd
-    // 5. update L2P
+    // 1. invalid old PCA address
+    // 2. allocate a new PCA address
+    // 3. send write cmd (read_modify_write)
+    // 4. update L2P
+    PCA_RULE my_pca;
     int ret;
-    int pca = L2P[lba];
-    char *tmp_buf = calloc(PAGE_SIZE, sizeof(char));
+    int pca; 
+    int new_pca;
+    char *tmp_buf;
 
-    if (pca != INVALID_PCA) {
-        nand_read(tmp_buf, pca);
-    }
-    memcpy(tmp_buf + offset, buf, size);
-
-    pca = get_next_pca();
-    if (pca == OUT_OF_BLOCK) {
+    new_pca = get_next_pca();
+    if (new_pca == OUT_OF_BLOCK) {
         return OUT_OF_BLOCK;
     }
-    ret = nand_write(tmp_buf, pca);
-    L2P[lba] = pca;
+
+    pca = L2P[lba];
+    if (pca != INVALID_PCA) {
+        my_pca.pca  = pca;
+        hot_pca.pca = pca;
+        valid_count[my_pca.fields.nand]--;
+        P2L_set(pca, INVALID_LBA);
+    } 
+
+    // if write size not align to PAGE_SIZE, do read_modify_write
+    if (size != PAGE_SIZE) {
+        tmp_buf = calloc(PAGE_SIZE, sizeof(char));
+        nand_read(tmp_buf, pca);
+        memcpy(tmp_buf + offset, buf, size);
+        ret = nand_write(tmp_buf, new_pca);
+    } else {
+        ret = nand_write(buf, new_pca);
+    }
+    L2P[lba] = new_pca;
+    P2L_set(new_pca, lba);
+
+    if (physic_size >= 80) 
+        ftl_gc();
+
     return ret;
 }
 
+static int ftl_gc_move(int block_index) {
+    int i;
+    PCA_RULE my_pca;
+    unsigned int new_pca;
+    unsigned int lba;
+    char *tmp_buf = calloc(PAGE_SIZE, sizeof(char));
+
+    my_pca.pca = 0;
+    my_pca.fields.nand = block_index;
+    for(i=0 ; i<PAGE_PER_BLOCK ; i++) {
+        my_pca.fields.lba = i;
+        lba = P2L[(my_pca.fields.nand * PAGE_PER_BLOCK + my_pca.fields.lba)];
+        if (lba != INVALID_LBA) {
+            nand_read(tmp_buf, my_pca.pca);
+            printf("########### gc move %d %d\n", i, lba);
+            new_pca = get_next_pca();
+            if (new_pca == OUT_OF_BLOCK) {
+                printf("ftl_gc: OUT_OF_BLOCK\n");
+                return OUT_OF_BLOCK;
+            }
+            nand_write(tmp_buf, new_pca);
+            // update table
+            P2L_set(new_pca, lba);
+            L2P[lba] = new_pca;
+        }
+    }
+    return nand_erase(block_index);
+}
+
+static void ftl_gc() {
+    int i;
+    int min_valid_count = 10;
+    int target_block    = -1;
+    for(i=0 ; i<PHYSICAL_NAND_NUM ; i++) {
+        if (i == curr_pca.fields.nand || i == hot_pca.fields.nand)
+            continue;
+        if (valid_count[i] == FREE_BLOCK)
+            continue;
+        if (valid_count[i] < min_valid_count) {
+            min_valid_count = valid_count[i];
+            target_block = i;
+        }
+    }
+    printf("############## gc %d: %d valid page\n", target_block, min_valid_count);
+
+    if (target_block != -1) {
+        ftl_gc_move(target_block);
+    }
+}
 
 static int ssd_file_type(const char* path) {
     if (strcmp(path, "/") == 0) {
@@ -420,6 +495,7 @@ int main(int argc, char* argv[]) {
     physic_size = 0;
     logic_size = 0;
     curr_pca.pca = INVALID_PCA;
+    hot_pca.pca  = INVALID_PCA;
     free_block_number = PHYSICAL_NAND_NUM;
 
     L2P = malloc(LOGICAL_NAND_NUM * PAGE_PER_BLOCK * sizeof(int));
